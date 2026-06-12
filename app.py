@@ -12,6 +12,7 @@ import subprocess
 import sys
 import os
 import tempfile
+import shutil
 
 import flask
 from flask import Flask, request, jsonify, Response
@@ -20,64 +21,59 @@ app = Flask(__name__)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-YT_DLP = "yt-dlp"  # assume on PATH (pip install puts it there)
-AUDIO_EXT = "m4a"  # 不用 ffmpeg，直接下 YouTube 原生 AAC
+# PythonAnywhere 上 yt-dlp 装在 ~/.local/bin/
+_YT_DLP = shutil.which("yt-dlp") or "/home/Begitar/.local/bin/yt-dlp"
+AUDIO_EXT = "m4a"
 AUDIO_MIME = "audio/mp4"
+
+# 环境变量：确保 subprocess 能找到 yt-dlp
+_PROC_ENV = {**os.environ, "PATH": f"/home/Begitar/.local/bin:{os.environ.get('PATH', '')}"}
+
+
+def _run_yt_dlp(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """运行 yt-dlp 并返回结果。"""
+    try:
+        return subprocess.run(
+            [_YT_DLP, "--no-warnings", *args],
+            capture_output=True, text=True, timeout=timeout,
+            env=_PROC_ENV,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("yt-dlp not found — run: pip install yt-dlp")
 
 
 def _yt_dlp_json(*args: str) -> list[dict]:
-    """Run yt-dlp search and return parsed JSON results."""
-    import yt_dlp
-    opts = {"quiet": True, "no_warnings": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        try:
-            raw = ydl.extract_info(*args, download=False)
-        except Exception as exc:
-            raise RuntimeError(f"yt-dlp failed: {exc}") from exc
-        if not raw or "entries" not in raw:
-            return []
-        return raw["entries"]
+    """Run yt-dlp with --dump-json and return parsed JSON lines."""
+    proc = _run_yt_dlp("--dump-json", *args, timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError(f"yt-dlp search failed:\n{proc.stderr[:300]}")
+    return [json.loads(line) for line in proc.stdout.strip().splitlines() if line.strip()]
 
 
 def _download_audio(url: str) -> tuple[bytes, str]:
     """
-    Download best audio track from YouTube.
-
-    Uses yt-dlp Python module directly (no subprocess).
+    Download best audio track from YouTube (no ffmpeg needed).
     Returns (file_bytes, extension).
     """
-    import yt_dlp
     with tempfile.TemporaryDirectory() as tmp:
         out_template = os.path.join(tmp, "audio.%(ext)s")
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "outtmpl": out_template,
-            "extract_flat": False,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=True)
-            except Exception as exc:
-                raise RuntimeError(f"yt-dlp download failed: {exc}") from exc
+        proc = _run_yt_dlp(
+            "-f", "bestaudio[ext=m4a]/bestaudio/best",
+            "--output", out_template,
+            "--print", "filename",
+            url,
+            timeout=300,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"yt-dlp download failed:\n{proc.stderr[:500]}")
 
-            # 找下载后的文件
-            ext = info.get("ext", AUDIO_EXT)
-            expected = os.path.join(tmp, f"audio.{ext}")
-            if os.path.isfile(expected):
-                with open(expected, "rb") as fh:
-                    return fh.read(), ext
-
-            # 有时 ext 不同，扫描目录找
-            for f in os.listdir(tmp):
-                fp = os.path.join(tmp, f)
-                if os.path.isfile(fp) and f != "audio":
-                    e = f.rsplit(".", 1)[-1]
-                    with open(fp, "rb") as fh:
-                        return fh.read(), e
-
+        actual_file = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+        if not actual_file or not os.path.isfile(actual_file):
             raise RuntimeError("yt-dlp did not produce an audio file")
+
+        ext = actual_file.rsplit(".", 1)[-1] if "." in actual_file else AUDIO_EXT
+        with open(actual_file, "rb") as fh:
+            return fh.read(), ext
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
