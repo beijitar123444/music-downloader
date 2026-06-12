@@ -26,52 +26,58 @@ AUDIO_MIME = "audio/mp4"
 
 
 def _yt_dlp_json(*args: str) -> list[dict]:
-    """Run yt-dlp with --dump-json and return parsed JSON lines."""
-    cmd = [YT_DLP, "--dump-json", "--no-warnings", *args]
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=30, text=True)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"yt-dlp failed (exit {exc.returncode})") from exc
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"{YT_DLP} not found — ensure it is installed (`pip install yt-dlp`)") from exc
-    return [json.loads(line) for line in out.strip().splitlines() if line.strip()]
+    """Run yt-dlp search and return parsed JSON results."""
+    import yt_dlp
+    opts = {"quiet": True, "no_warnings": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        try:
+            raw = ydl.extract_info(*args, download=False)
+        except Exception as exc:
+            raise RuntimeError(f"yt-dlp failed: {exc}") from exc
+        if not raw or "entries" not in raw:
+            return []
+        return raw["entries"]
 
 
 def _download_audio(url: str) -> tuple[bytes, str]:
     """
-    Download best audio track from YouTube WITHOUT ffmpeg.
+    Download best audio track from YouTube.
 
-    yt-dlp grabs the native AAC stream (m4a), no conversion needed.
+    Uses yt-dlp Python module directly (no subprocess).
     Returns (file_bytes, extension).
     """
+    import yt_dlp
     with tempfile.TemporaryDirectory() as tmp:
-        out_template = os.path.join(tmp, f"audio.%(ext)s")
-        dl_args = [
-            YT_DLP,
-            "--no-warnings",
-            "-f", "bestaudio[ext=m4a]/bestaudio/best",
-            "--output", out_template,
-            "--print", "filename",
-        ]
-        dl_args.append(url)
+        out_template = os.path.join(tmp, "audio.%(ext)s")
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": out_template,
+            "extract_flat": False,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception as exc:
+                raise RuntimeError(f"yt-dlp download failed: {exc}") from exc
 
-        try:
-            proc = subprocess.run(
-                dl_args, capture_output=True, text=True, timeout=300,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"{YT_DLP} not found") from exc
+            # 找下载后的文件
+            ext = info.get("ext", AUDIO_EXT)
+            expected = os.path.join(tmp, f"audio.{ext}")
+            if os.path.isfile(expected):
+                with open(expected, "rb") as fh:
+                    return fh.read(), ext
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"yt-dlp download failed:\n{proc.stderr[:500]}")
+            # 有时 ext 不同，扫描目录找
+            for f in os.listdir(tmp):
+                fp = os.path.join(tmp, f)
+                if os.path.isfile(fp) and f != "audio":
+                    e = f.rsplit(".", 1)[-1]
+                    with open(fp, "rb") as fh:
+                        return fh.read(), e
 
-        actual_file = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
-        if not actual_file or not os.path.isfile(actual_file):
             raise RuntimeError("yt-dlp did not produce an audio file")
-
-        ext = actual_file.rsplit(".", 1)[-1] if "." in actual_file else AUDIO_EXT
-        with open(actual_file, "rb") as fh:
-            return fh.read(), ext
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
