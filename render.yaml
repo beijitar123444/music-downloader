@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: music-downloader
+    runtime: python
+    region: oregon  # optional, defaults to oregon
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120 --workers 2
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
